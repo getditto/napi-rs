@@ -150,6 +150,11 @@ type_level_enum! {
 pub struct ThreadsafeFunction<T: 'static, ES: ErrorStrategy::T = ErrorStrategy::CalleeHandled> {
   raw_tsfn: sys::napi_threadsafe_function,
   aborted: Arc<AtomicBool>,
+  /// Set to `true` when the N-API environment begins teardown. When this is
+  /// true, calling napi functions from `call_js_cb` can crash in V8's
+  /// `node->IsInUse()` check. Shared with the env cleanup hook registered in
+  /// `create`.
+  env_tearing_down: Arc<AtomicBool>,
   _phantom: PhantomData<(T, ES)>,
 }
 
@@ -166,9 +171,24 @@ impl<T: 'static, ES: ErrorStrategy::T> Clone for ThreadsafeFunction<T, ES> {
     Self {
       raw_tsfn: self.raw_tsfn,
       aborted: Arc::clone(&self.aborted),
+      env_tearing_down: Arc::clone(&self.env_tearing_down),
       _phantom: PhantomData,
     }
   }
+}
+
+struct ThreadsafeFunctionContext<R> {
+  callback: R,
+  env_tearing_down: Arc<AtomicBool>,
+}
+
+struct ThreadsafeFunctionCleanupHookData {
+  flag: Arc<AtomicBool>,
+}
+
+unsafe extern "C" fn threadsafe_function_env_teardown_cleanup(data: *mut c_void) {
+  let hook_data = Box::from_raw(data as *mut ThreadsafeFunctionCleanupHookData);
+  hook_data.flag.store(true, Ordering::Release);
 }
 
 unsafe impl<T, ES: ErrorStrategy::T> Send for ThreadsafeFunction<T, ES> {}
@@ -195,9 +215,34 @@ impl<T: 'static, ES: ErrorStrategy::T> ThreadsafeFunction<T, ES> {
       sys::napi_create_string_utf8(env, s.as_ptr(), len, &mut async_resource_name)
     })?;
 
+    // Register an env cleanup hook so we can detect when the V8 environment
+    // begins tearing down. `call_js_cb` checks the flag on every invocation
+    // and bails out without making any napi calls if it is set, avoiding
+    // `Check failed: node->IsInUse()` aborts during teardown.
+    //
+    // The hook data is freed by the hook itself when it fires. If the TSFN is
+    // dropped before env teardown, the hook data is leaked (a small, bounded
+    // allocation per TSFN). The atomic flag itself is reference-counted via
+    // `Arc` and stays alive as long as any TSFN clone or pending `call_js_cb`
+    // invocation holds a reference.
+    let env_tearing_down = Arc::new(AtomicBool::new(false));
+    let hook_data = Box::into_raw(Box::new(ThreadsafeFunctionCleanupHookData {
+      flag: Arc::clone(&env_tearing_down),
+    }));
+    unsafe {
+      sys::napi_add_env_cleanup_hook(
+        env,
+        Some(threadsafe_function_env_teardown_cleanup),
+        hook_data as *mut c_void,
+      );
+    }
+
     let initial_thread_count = 1usize;
     let mut raw_tsfn = ptr::null_mut();
-    let ptr = Box::into_raw(Box::new(callback)) as *mut _;
+    let ctx = Box::into_raw(Box::new(ThreadsafeFunctionContext {
+      callback,
+      env_tearing_down: Arc::clone(&env_tearing_down),
+    })) as *mut _;
     check_status!(unsafe {
       sys::napi_create_threadsafe_function(
         env,
@@ -206,9 +251,9 @@ impl<T: 'static, ES: ErrorStrategy::T> ThreadsafeFunction<T, ES> {
         async_resource_name,
         max_queue_size,
         initial_thread_count,
-        ptr,
+        ctx,
         Some(thread_finalize_cb::<T, V, R>),
-        ptr,
+        ctx,
         Some(call_js_cb::<T, V, R, ES>),
         &mut raw_tsfn,
       )
@@ -217,6 +262,7 @@ impl<T: 'static, ES: ErrorStrategy::T> ThreadsafeFunction<T, ES> {
     Ok(ThreadsafeFunction {
       raw_tsfn,
       aborted: Arc::new(AtomicBool::new(false)),
+      env_tearing_down,
       _phantom: PhantomData,
     })
   }
@@ -306,7 +352,7 @@ impl<T: 'static> ThreadsafeFunction<T, ErrorStrategy::Fatal> {
 
 impl<T: 'static, ES: ErrorStrategy::T> Drop for ThreadsafeFunction<T, ES> {
   fn drop(&mut self) {
-    if !self.aborted.load(Ordering::Acquire) {
+    if !self.aborted.load(Ordering::Acquire) && !self.env_tearing_down.load(Ordering::Acquire) {
       let release_status = unsafe {
         sys::napi_release_threadsafe_function(
           self.raw_tsfn,
@@ -329,7 +375,9 @@ unsafe extern "C" fn thread_finalize_cb<T: 'static, V: NapiValue, R>(
   R: 'static + Send + FnMut(ThreadSafeCallContext<T>) -> Result<Vec<V>>,
 {
   // cleanup
-  drop(Box::<R>::from_raw(finalize_data.cast()));
+  drop(Box::<ThreadsafeFunctionContext<R>>::from_raw(
+    finalize_data.cast(),
+  ));
 }
 
 unsafe extern "C" fn call_js_cb<T: 'static, V: NapiValue, R, ES>(
@@ -341,7 +389,25 @@ unsafe extern "C" fn call_js_cb<T: 'static, V: NapiValue, R, ES>(
   R: 'static + Send + FnMut(ThreadSafeCallContext<T>) -> Result<Vec<V>>,
   ES: ErrorStrategy::T,
 {
-  let ctx: &mut R = &mut *context.cast::<R>();
+  let tsfn_ctx: &mut ThreadsafeFunctionContext<R> = &mut *context.cast();
+
+  // If the env is tearing down, drop the data without making any napi calls.
+  // Calling napi_get_undefined / napi_call_function / napi_get_null on a
+  // partially-torn-down env trips V8's `Check failed: node->IsInUse()` and
+  // aborts the process.
+  if tsfn_ctx.env_tearing_down.load(Ordering::Acquire) {
+    match ES::VALUE {
+      ErrorStrategy::CalleeHandled::VALUE => {
+        drop(Box::<Result<T>>::from_raw(data.cast()));
+      }
+      ErrorStrategy::Fatal::VALUE => {
+        drop(Box::<T>::from_raw(data.cast()));
+      }
+    }
+    return;
+  }
+
+  let ctx: &mut R = &mut tsfn_ctx.callback;
   let val: Result<T> = match ES::VALUE {
     ErrorStrategy::CalleeHandled::VALUE => *Box::<Result<T>>::from_raw(data.cast()),
     ErrorStrategy::Fatal::VALUE => Ok(*Box::<T>::from_raw(data.cast())),
