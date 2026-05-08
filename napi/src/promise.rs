@@ -20,6 +20,14 @@ pub struct FuturePromise<T, V: NapiValue> {
   /// Raw pointer to the cleanup hook data, needed to unregister the hook on
   /// normal completion. Null if the hook has already been unregistered.
   cleanup_hook_data: *mut c_void,
+  /// DEVX-877: a strong (`refcount=1`) `napi_ref` to the JSPromise returned
+  /// to JS. Pins the promise so JS GC can't collect it before `call_js_cb`
+  /// resolves the deferred. Without this, an internal SDK call whose
+  /// returned promise is unreferenced from JS lets the JSPromise (and the
+  /// deferred's backing v8 Persistent) be GC'd; when `napi_resolve_deferred`
+  /// later runs, it crashes inside V8's `GlobalHandles::Destroy` walking a
+  /// freed slot. Released in `call_js_cb` after resolve/reject.
+  promise_ref: sys::napi_ref,
 }
 
 unsafe impl<T, V: NapiValue> Send for FuturePromise<T, V> {}
@@ -38,6 +46,7 @@ impl<T, V: NapiValue> FuturePromise<T, V> {
   pub fn create(
     env: sys::napi_env,
     raw_deferred: sys::napi_deferred,
+    raw_promise: sys::napi_value,
     resolver: Box<dyn FnOnce(&mut Env, T) -> Result<V>>,
   ) -> Result<Self> {
     let mut async_resource_name = ptr::null_mut();
@@ -50,6 +59,12 @@ impl<T, V: NapiValue> FuturePromise<T, V> {
         &mut async_resource_name,
       )
     })?;
+
+    // DEVX-877: pin the JSPromise with an initial-refcount-1 napi_ref so JS GC
+    // can't collect it (and with it, the deferred's backing v8 Persistent)
+    // before we get a chance to resolve. Released in `call_js_cb`.
+    let mut promise_ref = ptr::null_mut();
+    check_status!(unsafe { sys::napi_create_reference(env, raw_promise, 1, &mut promise_ref) })?;
 
     let env_tearing_down = Arc::new(AtomicBool::new(false));
     let hook_data = Box::into_raw(Box::new(CleanupHookData {
@@ -67,6 +82,7 @@ impl<T, V: NapiValue> FuturePromise<T, V> {
       async_resource_name,
       env_tearing_down,
       cleanup_hook_data: hook_data as *mut c_void,
+      promise_ref,
     })
   }
 
@@ -135,6 +151,7 @@ unsafe extern "C" fn call_js_cb<T, V: NapiValue>(
   let env_tearing_down = future_promise.env_tearing_down.load(Ordering::Acquire)
     || crate::lifecycle::shutdown_requested();
   let cleanup_hook_data = future_promise.cleanup_hook_data;
+  let promise_ref = future_promise.promise_ref;
 
   if env_tearing_down {
     // The environment is tearing down. Calling `napi_resolve_deferred` /
@@ -144,6 +161,9 @@ unsafe extern "C" fn call_js_cb<T, V: NapiValue>(
     // Drop the future_promise and value to free Rust-side state, but skip every
     // N-API cleanup call that would touch the partially-torn-down environment.
     // The cleanup hook data is freed by the hook itself during teardown.
+    // The promise_ref is intentionally leaked: V8's GlobalHandle table is being
+    // torn down anyway, and `napi_delete_reference` would have the same crash
+    // window as `napi_resolve_deferred`. One bounded leak per teardown is OK.
     let value: Result<T> = ptr::read(data as *const _);
     drop(value);
     drop(future_promise);
@@ -172,4 +192,16 @@ unsafe extern "C" fn call_js_cb<T, V: NapiValue>(
       debug_assert!(status == sys::Status::napi_ok, "Reject promise failed");
     }
   };
+
+  // DEVX-877: release the strong ref we took on the JSPromise in
+  // `FuturePromise::create`. The promise has now been resolved or rejected, so
+  // JS-land already saw a settled state and ordinary GC can collect the
+  // promise object whenever it stops being referenced from JS.
+  if !promise_ref.is_null() {
+    let status = sys::napi_delete_reference(raw_env, promise_ref);
+    debug_assert!(
+      status == sys::Status::napi_ok,
+      "Delete promise reference failed"
+    );
+  }
 }

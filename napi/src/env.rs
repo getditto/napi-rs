@@ -1121,8 +1121,11 @@ impl Env {
     })?;
 
     let raw_env = self.0;
+    // DEVX-877: pass `raw_promise` so `FuturePromise::create` can pin it via
+    // `napi_create_reference`, preventing v8 from GC'ing the promise (and
+    // invalidating the deferred's backing slot) before the future resolves.
     let future_promise =
-      promise::FuturePromise::create(raw_env, raw_deferred, Box::from(resolver))?;
+      promise::FuturePromise::create(raw_env, raw_deferred, raw_promise, Box::from(resolver))?;
     let future_to_resolve = promise::resolve_from_future(future_promise.start()?, fut);
     handle.spawn(future_to_resolve);
     Ok(unsafe { JsObject::from_raw_unchecked(self.0, raw_promise) })
