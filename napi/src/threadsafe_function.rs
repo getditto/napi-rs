@@ -3,7 +3,7 @@ use std::ffi::CString;
 use std::marker::PhantomData;
 use std::os::raw::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::{check_status, sys, Env, Error, JsError, JsFunction, NapiValue, Result, Status};
@@ -155,56 +155,7 @@ pub struct ThreadsafeFunction<T: 'static, ES: ErrorStrategy::T = ErrorStrategy::
   /// `node->IsInUse()` check. Shared with the env cleanup hook registered in
   /// `create`.
   env_tearing_down: Arc<AtomicBool>,
-  /// DEVX-877: shared lifecycle handle, registered with
-  /// `crate::lifecycle::register_releasable` on creation. Holds the raw TSFN
-  /// pointer and a `aborted_for_shutdown` flag. The registry walks
-  /// `Weak<TsfnLifecycleHandle>` during `signal_shutdown_requested` and calls
-  /// `napi_release_threadsafe_function(abort)` on each live entry. After
-  /// that, every `Drop` on this `ThreadsafeFunction` (or any of its clones)
-  /// sees the flag set and skips its own per-clone release, avoiding
-  /// double-free on a TSFN that Node has already torn down.
-  lifecycle: Arc<TsfnLifecycleHandle>,
   _phantom: PhantomData<(T, ES)>,
-}
-
-/// DEVX-877: shared lifecycle handle for a `ThreadsafeFunction`.
-///
-/// One handle per TSFN, shared across every `ThreadsafeFunction` clone via
-/// `Arc`. The shutdown registry holds a `Weak<TsfnLifecycleHandle>`; on
-/// shutdown it calls [`Releasable::release_for_shutdown`] which forcibly
-/// aborts the TSFN. After that, regular `Drop` calls are no-ops.
-struct TsfnLifecycleHandle {
-  raw_tsfn: AtomicPtr<sys::napi_threadsafe_function__>,
-  /// Set to `true` once the registry has called `napi_release(abort)` on
-  /// this TSFN. Subsequent `Drop` calls check this flag and skip their own
-  /// `napi_release(release)`, since Node has already torn the TSFN down.
-  aborted_for_shutdown: AtomicBool,
-}
-
-impl crate::lifecycle::Releasable for TsfnLifecycleHandle {
-  fn release_for_shutdown(&self) {
-    // CAS so concurrent Drop and registry walk don't both call napi_release.
-    if self
-      .aborted_for_shutdown
-      .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-      .is_err()
-    {
-      return;
-    }
-    let raw = self.raw_tsfn.swap(ptr::null_mut(), Ordering::AcqRel);
-    if raw.is_null() {
-      return;
-    }
-    // Release with `abort` mode: forcibly invalidate the TSFN regardless of
-    // its current refcount. After this returns, the underlying napi_ref is
-    // gone and Node won't try to finalize it during `Environment::RunCleanup`.
-    unsafe {
-      sys::napi_release_threadsafe_function(
-        raw,
-        sys::napi_threadsafe_function_release_mode::napi_tsfn_abort,
-      );
-    }
-  }
 }
 
 impl<T: 'static, ES: ErrorStrategy::T> Clone for ThreadsafeFunction<T, ES> {
@@ -221,7 +172,6 @@ impl<T: 'static, ES: ErrorStrategy::T> Clone for ThreadsafeFunction<T, ES> {
       raw_tsfn: self.raw_tsfn,
       aborted: Arc::clone(&self.aborted),
       env_tearing_down: Arc::clone(&self.env_tearing_down),
-      lifecycle: Arc::clone(&self.lifecycle),
       _phantom: PhantomData,
     }
   }
@@ -309,24 +259,10 @@ impl<T: 'static, ES: ErrorStrategy::T> ThreadsafeFunction<T, ES> {
       )
     })?;
 
-    // DEVX-877: register the TSFN's lifecycle handle with the shutdown
-    // registry. On `process.on('beforeExit')` the registry will walk every
-    // live entry and forcibly abort it, so Node never reaches teardown
-    // with an unreleased TSFN whose v8 GlobalHandle would crash during
-    // `Environment::RunCleanup`.
-    let lifecycle = Arc::new(TsfnLifecycleHandle {
-      raw_tsfn: AtomicPtr::new(raw_tsfn as *mut sys::napi_threadsafe_function__),
-      aborted_for_shutdown: AtomicBool::new(false),
-    });
-    crate::lifecycle::register_releasable(
-      Arc::downgrade(&lifecycle) as std::sync::Weak<dyn crate::lifecycle::Releasable>
-    );
-
     Ok(ThreadsafeFunction {
       raw_tsfn,
       aborted: Arc::new(AtomicBool::new(false)),
       env_tearing_down,
-      lifecycle,
       _phantom: PhantomData,
     })
   }
@@ -362,13 +298,6 @@ impl<T: 'static, ES: ErrorStrategy::T> ThreadsafeFunction<T, ES> {
   }
 
   pub fn abort(self) -> Result<()> {
-    // DEVX-877: if the shutdown registry already aborted this TSFN, just
-    // mark our local flag and return. Calling napi_release on an
-    // already-aborted TSFN would hit a freed handle.
-    if self.lifecycle.aborted_for_shutdown.load(Ordering::Acquire) {
-      self.aborted.store(true, Ordering::Release);
-      return Ok(());
-    }
     check_status!(unsafe {
       sys::napi_release_threadsafe_function(
         self.raw_tsfn,
@@ -376,18 +305,6 @@ impl<T: 'static, ES: ErrorStrategy::T> ThreadsafeFunction<T, ES> {
       )
     })?;
     self.aborted.store(true, Ordering::Release);
-    // Mark the lifecycle handle too so subsequent shutdown walks skip this
-    // entry. (`compare_exchange` semantics in `release_for_shutdown` already
-    // make double-abort safe, but we set the flag eagerly to keep the
-    // registry walk's work to a minimum.)
-    self
-      .lifecycle
-      .aborted_for_shutdown
-      .store(true, Ordering::Release);
-    self
-      .lifecycle
-      .raw_tsfn
-      .store(ptr::null_mut(), Ordering::Release);
     Ok(())
   }
 
@@ -435,15 +352,12 @@ impl<T: 'static> ThreadsafeFunction<T, ErrorStrategy::Fatal> {
 
 impl<T: 'static, ES: ErrorStrategy::T> Drop for ThreadsafeFunction<T, ES> {
   fn drop(&mut self) {
-    // DEVX-877: if the shutdown registry has already aborted this TSFN
-    // (during `process.on('beforeExit')`), there's nothing left to release —
-    // Node has invalidated the underlying napi_ref. Calling
-    // `napi_release_threadsafe_function` again would either no-op or hit a
-    // freed handle, so we skip.
-    if self.lifecycle.aborted_for_shutdown.load(Ordering::Acquire) {
-      return;
-    }
-    if !self.aborted.load(Ordering::Acquire) && !self.env_tearing_down.load(Ordering::Acquire) {
+    // DEVX-877: also consult the process-wide shutdown signal so we don't release
+    // a TSFN whose underlying `Reference` is already being finalized by v8.
+    if !self.aborted.load(Ordering::Acquire)
+      && !self.env_tearing_down.load(Ordering::Acquire)
+      && !crate::lifecycle::shutdown_requested()
+    {
       let release_status = unsafe {
         sys::napi_release_threadsafe_function(
           self.raw_tsfn,
