@@ -121,7 +121,13 @@ unsafe extern "C" fn complete<T: Task>(
 ) {
   let mut work = Box::from_raw(data as *mut AsyncWork<T>);
   let napi_async_work = mem::replace(&mut work.napi_async_work, ptr::null_mut());
-  let env_tearing_down = work.env_tearing_down.load(Ordering::Acquire);
+  // DEVX-877: in addition to the per-resource env-cleanup-hook flag, also consult the
+  // process-wide shutdown signal. The latter is set from JS (`process.on('beforeExit')`)
+  // and fires earlier than env-cleanup-hooks, which on Node.js >= 22 / arm64 run after
+  // v8 has already started finalizing GlobalHandles — too late to safely resolve a
+  // deferred or delete the async work.
+  let env_tearing_down =
+    work.env_tearing_down.load(Ordering::Acquire) || crate::lifecycle::shutdown_requested();
   let cleanup_hook_data = mem::replace(&mut work.cleanup_hook_data, ptr::null_mut());
 
   if status == sys::Status::napi_cancelled || env_tearing_down {

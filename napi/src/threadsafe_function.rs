@@ -352,7 +352,12 @@ impl<T: 'static> ThreadsafeFunction<T, ErrorStrategy::Fatal> {
 
 impl<T: 'static, ES: ErrorStrategy::T> Drop for ThreadsafeFunction<T, ES> {
   fn drop(&mut self) {
-    if !self.aborted.load(Ordering::Acquire) && !self.env_tearing_down.load(Ordering::Acquire) {
+    // DEVX-877: also consult the process-wide shutdown signal so we don't release
+    // a TSFN whose underlying `Reference` is already being finalized by v8.
+    if !self.aborted.load(Ordering::Acquire)
+      && !self.env_tearing_down.load(Ordering::Acquire)
+      && !crate::lifecycle::shutdown_requested()
+    {
       let release_status = unsafe {
         sys::napi_release_threadsafe_function(
           self.raw_tsfn,
@@ -395,7 +400,9 @@ unsafe extern "C" fn call_js_cb<T: 'static, V: NapiValue, R, ES>(
   // Calling napi_get_undefined / napi_call_function / napi_get_null on a
   // partially-torn-down env trips V8's `Check failed: node->IsInUse()` and
   // aborts the process.
-  if tsfn_ctx.env_tearing_down.load(Ordering::Acquire) {
+  // DEVX-877: also consult the process-wide shutdown signal — fires earlier than
+  // env-cleanup-hooks.
+  if tsfn_ctx.env_tearing_down.load(Ordering::Acquire) || crate::lifecycle::shutdown_requested() {
     match ES::VALUE {
       ErrorStrategy::CalleeHandled::VALUE => {
         drop(Box::<Result<T>>::from_raw(data.cast()));

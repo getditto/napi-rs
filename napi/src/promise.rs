@@ -130,7 +130,10 @@ unsafe extern "C" fn call_js_cb<T, V: NapiValue>(
   data: *mut c_void,
 ) {
   let future_promise = Box::from_raw(context as *mut FuturePromise<T, V>);
-  let env_tearing_down = future_promise.env_tearing_down.load(Ordering::Acquire);
+  // DEVX-877: also consult the process-wide shutdown signal — fires earlier than
+  // env-cleanup-hooks, which run after v8 has begun finalizing GlobalHandles.
+  let env_tearing_down = future_promise.env_tearing_down.load(Ordering::Acquire)
+    || crate::lifecycle::shutdown_requested();
   let cleanup_hook_data = future_promise.cleanup_hook_data;
 
   if env_tearing_down {

@@ -82,6 +82,7 @@ mod cleanup_env;
 mod env;
 mod error;
 mod js_values;
+pub mod lifecycle;
 mod module;
 #[cfg(all(feature = "tokio_rt", feature = "napi4"))]
 mod promise;
