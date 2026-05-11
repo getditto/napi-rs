@@ -18,6 +18,14 @@ struct AsyncWork<T: Task> {
   /// Raw pointer to the cleanup hook data, needed to unregister the hook on
   /// normal completion. Null if the hook has already been unregistered.
   cleanup_hook_data: *mut c_void,
+  /// DEVX-877: a strong (`refcount=1`) `napi_ref` to the JSPromise returned to
+  /// JS. Mirrors the pin in `FuturePromise::create`. Without this, an internal
+  /// SDK call whose returned promise is unreferenced from JS lets the
+  /// JSPromise (and the deferred's backing v8 Persistent) be GC'd; when
+  /// `napi_resolve_deferred` later runs in `complete`, it crashes inside V8's
+  /// `GlobalHandles::Destroy` walking a freed slot. Released in `complete`
+  /// after resolve/reject.
+  promise_ref: sys::napi_ref,
 }
 
 pub struct AsyncWorkPromise<'env> {
@@ -60,6 +68,13 @@ pub fn run<T: Task>(env: &Env, task: T) -> Result<AsyncWorkPromise<'_>> {
     sys::napi_create_string_utf8(env.0, s.as_ptr() as *const c_char, s.len(), &mut raw_name)
   })?;
 
+  // DEVX-877: pin the JSPromise with an initial-refcount-1 napi_ref so JS GC
+  // can't collect it (and with it, the deferred's backing v8 Persistent)
+  // before `complete` resolves the deferred. Mirrors the pin in
+  // `FuturePromise::create`. Released in `complete` after resolve/reject.
+  let mut promise_ref = ptr::null_mut();
+  check_status!(unsafe { sys::napi_create_reference(env.0, raw_promise, 1, &mut promise_ref) })?;
+
   // Create a shared flag that the env cleanup hook will set when teardown begins.
   let env_tearing_down = Arc::new(AtomicBool::new(false));
   let hook_data = Box::into_raw(Box::new(CleanupHookData {
@@ -76,6 +91,7 @@ pub fn run<T: Task>(env: &Env, task: T) -> Result<AsyncWorkPromise<'_>> {
     napi_async_work: ptr::null_mut(),
     env_tearing_down,
     cleanup_hook_data: hook_data as *mut c_void,
+    promise_ref,
   }));
   check_status!(unsafe {
     sys::napi_create_async_work(
@@ -129,6 +145,7 @@ unsafe extern "C" fn complete<T: Task>(
   let env_tearing_down =
     work.env_tearing_down.load(Ordering::Acquire) || crate::lifecycle::shutdown_requested();
   let cleanup_hook_data = mem::replace(&mut work.cleanup_hook_data, ptr::null_mut());
+  let promise_ref = mem::replace(&mut work.promise_ref, ptr::null_mut());
 
   if status == sys::Status::napi_cancelled || env_tearing_down {
     // The work was cancelled (e.g., during Node.js shutdown) or the environment
@@ -142,6 +159,11 @@ unsafe extern "C" fn complete<T: Task>(
     // The cleanup hook data is freed by the hook itself during teardown, or leaked
     // if we got napi_cancelled without teardown (acceptable — it's a small allocation
     // and this only happens during process exit).
+    //
+    // The promise_ref is intentionally leaked: V8's GlobalHandle table is being
+    // torn down anyway, and `napi_delete_reference` would have the same crash
+    // window as `napi_resolve_deferred`. One bounded leak per teardown is OK.
+    let _ = promise_ref;
     drop(work);
     return;
   }
@@ -177,4 +199,16 @@ unsafe extern "C" fn complete<T: Task>(
     delete_status == sys::Status::napi_ok,
     "Delete async work failed"
   );
+
+  // DEVX-877: release the strong ref we took on the JSPromise in `run`. The
+  // promise has now been resolved or rejected, so JS-land already saw a settled
+  // state and ordinary GC can collect the promise object whenever it stops
+  // being referenced from JS.
+  if !promise_ref.is_null() {
+    let ref_status = sys::napi_delete_reference(env, promise_ref);
+    debug_assert!(
+      ref_status == sys::Status::napi_ok,
+      "Delete async_work promise reference failed"
+    );
+  }
 }
