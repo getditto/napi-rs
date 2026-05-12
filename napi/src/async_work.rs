@@ -204,11 +204,26 @@ unsafe extern "C" fn complete<T: Task>(
   // promise has now been resolved or rejected, so JS-land already saw a settled
   // state and ordinary GC can collect the promise object whenever it stops
   // being referenced from JS.
+  //
+  // We use `napi_reference_unref` (drops refcount → 0) rather than
+  // `napi_delete_reference` (destroys the Reference object and its v8
+  // Persistent slot). The latter triggered V8_Fatal in
+  // `GlobalHandles::Destroy` on iter 38 of the first validation run for
+  // `ditto_logger_set_custom_log_cb`, because by the time `complete` fires
+  // for a long-lived async_work, the env may already be transiently
+  // tearing down state that makes explicit slot destruction unsafe — the
+  // same teardown window the env-tearing-down check above guards the
+  // resolve against, but our cleanup hook is unregistered before we get
+  // here so we can't re-check it. With unref, V8's weak-handle path
+  // clears the slot during normal GC instead, and node's env teardown
+  // destroys the (now empty) Reference object safely. Small bounded leak
+  // (one Reference per async_work call) until env teardown.
   if !promise_ref.is_null() {
-    let ref_status = sys::napi_delete_reference(env, promise_ref);
+    let mut new_refcount = 0u32;
+    let ref_status = sys::napi_reference_unref(env, promise_ref, &mut new_refcount);
     debug_assert!(
       ref_status == sys::Status::napi_ok,
-      "Delete async_work promise reference failed"
+      "Unref async_work promise reference failed"
     );
   }
 }
