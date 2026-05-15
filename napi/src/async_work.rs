@@ -74,6 +74,13 @@ pub fn run<T: Task>(env: &Env, task: T) -> Result<AsyncWorkPromise<'_>> {
   // `FuturePromise::create`. Released in `complete` after resolve/reject.
   let mut promise_ref = ptr::null_mut();
   check_status!(unsafe { sys::napi_create_reference(env.0, raw_promise, 1, &mut promise_ref) })?;
+  // DEVX-877 instrumentation: log every Reference allocation so we can
+  // cross-reference with the V8 NodeSpace::Free double-free log to identify
+  // which Reference is being destroyed twice.
+  eprintln!(
+    "[DEVX-877] napi_create_reference async_work env={:p} promise_ref={:p} raw_promise={:p}",
+    env.0, promise_ref, raw_promise
+  );
 
   // Create a shared flag that the env cleanup hook will set when teardown begins.
   let env_tearing_down = Arc::new(AtomicBool::new(false));
@@ -163,6 +170,10 @@ unsafe extern "C" fn complete<T: Task>(
     // The promise_ref is intentionally leaked: V8's GlobalHandle table is being
     // torn down anyway, and `napi_delete_reference` would have the same crash
     // window as `napi_resolve_deferred`. One bounded leak per teardown is OK.
+    eprintln!(
+      "[DEVX-877] async_work teardown leak: env={:p} promise_ref={:p} env_tearing_down={}",
+      env, promise_ref, env_tearing_down
+    );
     let _ = promise_ref;
     drop(work);
     return;
@@ -221,6 +232,11 @@ unsafe extern "C" fn complete<T: Task>(
   if !promise_ref.is_null() {
     let mut new_refcount = 0u32;
     let ref_status = sys::napi_reference_unref(env, promise_ref, &mut new_refcount);
+    // DEVX-877 instrumentation
+    eprintln!(
+      "[DEVX-877] napi_reference_unref async_work env={:p} promise_ref={:p} new_refcount={} status={}",
+      env, promise_ref, new_refcount, ref_status as i32
+    );
     debug_assert!(
       ref_status == sys::Status::napi_ok,
       "Unref async_work promise reference failed"
