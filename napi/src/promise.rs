@@ -65,11 +65,6 @@ impl<T, V: NapiValue> FuturePromise<T, V> {
     // before we get a chance to resolve. Released in `call_js_cb`.
     let mut promise_ref = ptr::null_mut();
     check_status!(unsafe { sys::napi_create_reference(env, raw_promise, 1, &mut promise_ref) })?;
-    // DEVX-877 instrumentation
-    eprintln!(
-      "[DEVX-877] napi_create_reference FuturePromise env={:p} promise_ref={:p} raw_promise={:p}",
-      env, promise_ref, raw_promise
-    );
 
     let env_tearing_down = Arc::new(AtomicBool::new(false));
     let hook_data = Box::into_raw(Box::new(CleanupHookData {
@@ -169,10 +164,14 @@ unsafe extern "C" fn call_js_cb<T, V: NapiValue>(
     // The promise_ref is intentionally leaked: V8's GlobalHandle table is being
     // torn down anyway, and `napi_delete_reference` would have the same crash
     // window as `napi_resolve_deferred`. One bounded leak per teardown is OK.
-    eprintln!(
-      "[DEVX-877] FuturePromise teardown leak: env={:p} promise_ref={:p} env_tearing_down={}",
-      raw_env, promise_ref, env_tearing_down
-    );
+    {
+      use std::io::Write as _;
+      let _ = writeln!(
+        std::io::stderr(),
+        "[DEVX-877] FuturePromise teardown leak: env={:p} promise_ref={:p} env_tearing_down={}",
+        raw_env, promise_ref, env_tearing_down
+      );
+    }
     let value: Result<T> = ptr::read(data as *const _);
     drop(value);
     drop(future_promise);
@@ -219,11 +218,6 @@ unsafe extern "C" fn call_js_cb<T, V: NapiValue>(
   if !promise_ref.is_null() {
     let mut new_refcount = 0u32;
     let status = sys::napi_reference_unref(raw_env, promise_ref, &mut new_refcount);
-    // DEVX-877 instrumentation
-    eprintln!(
-      "[DEVX-877] napi_reference_unref FuturePromise env={:p} promise_ref={:p} new_refcount={} status={}",
-      raw_env, promise_ref, new_refcount, status as i32
-    );
     debug_assert!(
       status == sys::Status::napi_ok,
       "Unref promise reference failed"
