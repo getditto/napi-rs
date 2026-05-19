@@ -201,26 +201,11 @@ unsafe extern "C" fn call_js_cb<T, V: NapiValue>(
     }
   };
 
-  // DEVX-877: release the strong ref we took on the JSPromise in
-  // `FuturePromise::create`. The promise has now been resolved or rejected, so
-  // JS-land already saw a settled state and ordinary GC can collect the
-  // promise object whenever it stops being referenced from JS.
-  //
-  // Use `napi_reference_unref` (drops refcount → 0) rather than
-  // `napi_delete_reference` (destroys the Reference object and its v8
-  // Persistent slot). The latter has triggered V8_Fatal in
-  // `GlobalHandles::Destroy` from the parallel async_work pin under
-  // teardown-window conditions; the same pattern could surface here for
-  // long-lived futures. With unref, V8's weak-handle path clears the slot
-  // during normal GC instead, and node's env teardown destroys the (now
-  // empty) Reference object safely. Small bounded leak (one Reference per
-  // FuturePromise call) until env teardown.
-  if !promise_ref.is_null() {
-    let mut new_refcount = 0u32;
-    let status = sys::napi_reference_unref(raw_env, promise_ref, &mut new_refcount);
-    debug_assert!(
-      status == sys::Status::napi_ok,
-      "Unref promise reference failed"
-    );
-  }
+  // DEVX-877: leak the strong ref we took on the JSPromise in
+  // `FuturePromise::create`. Same reasoning as the async_work pin —
+  // both `napi_delete_reference` and `napi_reference_unref` race V8's
+  // GlobalHandles state machine and trip CHECKs at unpredictable times.
+  // Leak instead; the Reference is destroyed at napi env teardown via
+  // the reflist walk. See `async_work::complete` for the full rationale.
+  let _ = promise_ref;
 }

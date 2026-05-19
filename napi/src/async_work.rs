@@ -208,30 +208,26 @@ unsafe extern "C" fn complete<T: Task>(
     "Delete async work failed"
   );
 
-  // DEVX-877: release the strong ref we took on the JSPromise in `run`. The
-  // promise has now been resolved or rejected, so JS-land already saw a settled
-  // state and ordinary GC can collect the promise object whenever it stops
-  // being referenced from JS.
+  // DEVX-877: leak the strong ref we took on the JSPromise in `run`.
   //
-  // We use `napi_reference_unref` (drops refcount → 0) rather than
-  // `napi_delete_reference` (destroys the Reference object and its v8
-  // Persistent slot). The latter triggered V8_Fatal in
-  // `GlobalHandles::Destroy` on iter 38 of the first validation run for
-  // `ditto_logger_set_custom_log_cb`, because by the time `complete` fires
-  // for a long-lived async_work, the env may already be transiently
-  // tearing down state that makes explicit slot destruction unsafe — the
-  // same teardown window the env-tearing-down check above guards the
-  // resolve against, but our cleanup hook is unregistered before we get
-  // here so we can't re-check it. With unref, V8's weak-handle path
-  // clears the slot during normal GC instead, and node's env teardown
-  // destroys the (now empty) Reference object safely. Small bounded leak
-  // (one Reference per async_work call) until env teardown.
-  if !promise_ref.is_null() {
-    let mut new_refcount = 0u32;
-    let ref_status = sys::napi_reference_unref(env, promise_ref, &mut new_refcount);
-    debug_assert!(
-      ref_status == sys::Status::napi_ok,
-      "Unref async_work promise reference failed"
-    );
-  }
+  // We tried two things and both crash. `napi_delete_reference` triggers
+  // V8_Fatal in `GlobalHandles::Destroy` during teardown windows.
+  // `napi_reference_unref` (the "safer" alternative that drops refcount
+  // to 0 and lets V8's weak-callback path clean up) triggers V8_Fatal in
+  // `GlobalHandles::MakeWeak`, hitting V8's
+  // `CHECK_NE(object_, kGlobalHandleZapValue)` because by the time we
+  // reach this point the slot has already been zapped — still unclear
+  // by what. The instrumented patched-node run (20060e/3b35d87)
+  // captured the MakeWeak stack: `napi::async_work::complete` →
+  // `napi_reference_unref` → `GlobalHandles::MakeWeak` → `V8_Fatal`,
+  // mid-flight in `uv__work_done` (not during teardown).
+  //
+  // So: do nothing. The Reference is bounded (one per async_work call)
+  // and is destroyed at napi env teardown via the env's `reflist` walk
+  // calling `~Reference` → `persistent_.Reset()` →
+  // `GlobalHandles::Destroy` → `NodeSpace::Free`. If the slot has
+  // already been freed by V8 internals, the patched-node experimental
+  // V8 patch absorbs the double-free silently; on stock node it would
+  // CHECK-abort (Class A), which is the original DEVX-877 crash.
+  let _ = promise_ref;
 }
